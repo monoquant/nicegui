@@ -19,8 +19,9 @@ class RedisPersistentDict(PersistentDict):
         if not optional_features.has("redis"):
             raise ImportError('Redis is not installed. Please run "pip install nicegui[redis]".')
         self.url = url
+        self.cluster = cluster
 
-        if cluster:
+        if self.cluster:
             r = redis.RedisCluster
         else:
             r = redis.Redis
@@ -63,7 +64,10 @@ class RedisPersistentDict(PersistentDict):
 
     def _start_listening(self) -> None:
         async def listen():
-            await self.pubsub.subscribe(self.key + "changes")
+            if self.cluster:
+                await self.pubsub.ssubscribe(self.key + "changes")
+            else:
+                await self.pubsub.subscribe(self.key + "changes")
             async for message in self.pubsub.listen():
                 if message["type"] == "message":
                     new_data = json.loads(message["data"])
@@ -81,7 +85,10 @@ class RedisPersistentDict(PersistentDict):
         async def backup() -> None:
             pipeline = self.redis_client.pipeline()
             pipeline.set(self.key, json.dumps(self))
-            pipeline.publish(self.key + "changes", json.dumps(self))
+            if self.cluster:
+                pipeline.spublish(self.key + "changes", json.dumps(self))
+            else:
+                pipeline.publish(self.key + "changes", json.dumps(self))
             await pipeline.execute()
 
         if core.loop:
@@ -91,7 +98,10 @@ class RedisPersistentDict(PersistentDict):
 
     async def close(self) -> None:
         """Close Redis connection and subscription."""
-        await self.pubsub.unsubscribe()
+        if self.cluster:
+            await self.pubsub.sunsubscribe()
+        else:
+            await self.pubsub.unsubscribe()
         await self.pubsub.close()
         await self.redis_client.close()
 
