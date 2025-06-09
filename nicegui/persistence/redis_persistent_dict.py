@@ -83,13 +83,10 @@ class RedisPersistentDict(PersistentDict):
         """Publish the data to Redis and notify other instances."""
 
         async def backup() -> None:
-            pipeline = self.redis_client.pipeline()
-            pipeline.set(self.key, json.dumps(self))
             if self.cluster:
-                pipeline.spublish(self.key + "changes", json.dumps(self))
+                await self.redis_client.spublish(self.key + "changes", json.dumps(self))
             else:
-                pipeline.publish(self.key + "changes", json.dumps(self))
-            await pipeline.execute()
+                await self.redis_client.publish(self.key + "changes", json.dumps(self))
 
         if core.loop:
             background_tasks.create_lazy(backup(), name=f"redis-{self.key}")
