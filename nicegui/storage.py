@@ -58,6 +58,7 @@ class Storage:
     '''URL to use for shared persistent storage via Redis. Defaults to None, which means local file storage is used.'''
 
     redis_cluster = os.environ.get('NICEGUI_REDIS_CLUSTER', False)
+    '''Whether to use a Redis cluster for shared persistent storage. Defaults to False, which means a single Redis instance is used.'''
 
     redis_key_prefix = os.environ.get('NICEGUI_REDIS_KEY_PREFIX', 'nicegui:')
     '''Prefix for Redis keys. Defaults to "nicegui:".'''
@@ -73,7 +74,7 @@ class Storage:
     @staticmethod
     def _create_persistent_dict(id: str) -> PersistentDict:  # pylint: disable=redefined-builtin
         if Storage.redis_url:
-            return RedisPersistentDict(url=Storage.redis_url, id=id, key_prefix=Storage.redis_key_prefix, cluster=redis_cluster)
+            return RedisPersistentDict(url=Storage.redis_url, id=id, key_prefix=Storage.redis_key_prefix, cluster=Storage.redis_cluster)
         else:
             return FilePersistentDict(Storage.path / f'storage-{id}.json', encoding='utf-8')
 
