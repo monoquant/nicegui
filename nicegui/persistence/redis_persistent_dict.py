@@ -4,7 +4,7 @@ from .persistent_dict import PersistentDict
 
 try:
     import redis as redis_sync
-    import redis.asyncio as redis
+    import redis
 
     optional_features.register("redis")
 except ImportError:
