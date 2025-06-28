@@ -44,7 +44,6 @@ class RedisPersistentDict(PersistentDict):
                 url,
                 health_check_interval=10,
                 socket_connect_timeout=5,
-                retry_on_timeout=True,
                 socket_keepalive=True,
             )
             # Fallback to standalone for Pub/Sub
@@ -52,7 +51,6 @@ class RedisPersistentDict(PersistentDict):
                 url,
                 health_check_interval=10,
                 socket_connect_timeout=5,
-                retry_on_timeout=True,
                 socket_keepalive=True,
             ).pubsub()
         else:
