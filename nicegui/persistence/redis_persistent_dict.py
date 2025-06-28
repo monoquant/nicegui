@@ -4,8 +4,8 @@ from ..logging import log
 from .persistent_dict import PersistentDict
 
 try:
-    import redis                        # sync standalone
-    import redis.asyncio as redis_async # async standalone
+    import redis                        # sync standalone client
+    import redis.asyncio as redis_async # async standalone client
     from redis.cluster import RedisCluster as SyncRedisCluster
     from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
     optional_features.register('redis')
@@ -15,8 +15,9 @@ except ImportError:
 
 class RedisPersistentDict(PersistentDict):
     """
-    A PersistentDict backed by Redis (standalone or cluster) with async & sync support.
-    Switches to cluster mode only when WORK_ENV=KUBERNETES.
+    A dict persisted in Redis, with optional cluster mode.
+    Accepts `cluster: bool`—when True, uses RedisCluster clients;
+    and for async Pub/Sub falls back to a standalone client.
     """
 
     def __init__(
@@ -24,7 +25,8 @@ class RedisPersistentDict(PersistentDict):
         *,
         url: str,
         id: str,
-        key_prefix: str = 'nicegui:'
+        key_prefix: str = 'nicegui:',
+        cluster: bool = False,
     ) -> None:
         if not optional_features.has('redis'):
             raise ImportError(
@@ -34,13 +36,10 @@ class RedisPersistentDict(PersistentDict):
 
         self.url = url
         self.key = key_prefix + id
+        self.is_cluster = cluster
 
-        # Determine mode from environment
-        is_cluster = os.getenv('WORK_ENV', '').upper() == 'KUBERNETES'
-        self.is_cluster = is_cluster
-
-        # Instantiate the appropriate async client
-        if is_cluster:
+        # Async command client
+        if cluster:
             self.redis_client = AsyncRedisCluster.from_url(
                 url,
                 health_check_interval=10,
@@ -48,6 +47,14 @@ class RedisPersistentDict(PersistentDict):
                 retry_on_timeout=True,
                 socket_keepalive=True,
             )
+            # Fallback to standalone for Pub/Sub
+            self.pubsub = redis_async.from_url(
+                url,
+                health_check_interval=10,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+                socket_keepalive=True,
+            ).pubsub()
         else:
             self.redis_client = redis_async.from_url(
                 url,
@@ -56,9 +63,7 @@ class RedisPersistentDict(PersistentDict):
                 retry_on_timeout=True,
                 socket_keepalive=True,
             )
-
-        # Prepare pub/sub for change notifications
-        self.pubsub = self.redis_client.pubsub()
+            self.pubsub = self.redis_client.pubsub()
 
         super().__init__(data={}, on_change=self.publish)
 
@@ -117,7 +122,7 @@ class RedisPersistentDict(PersistentDict):
             core.app.on_startup(backup())
 
     async def close(self) -> None:
-        """Unsubscribe and close the Redis connection cleanly."""
+        """Unsubscribe and close Redis connections cleanly."""
         await self.pubsub.unsubscribe()
         await self.pubsub.close()
         await self.redis_client.close()
