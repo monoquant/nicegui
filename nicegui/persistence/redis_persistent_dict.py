@@ -1,65 +1,102 @@
+import os
 from .. import background_tasks, core, json, optional_features
 from ..logging import log
 from .persistent_dict import PersistentDict
 
 try:
-    import redis as redis_sync
-    import redis.asyncio as redis
+    import redis                        # sync standalone
+    import redis.asyncio as redis_async # async standalone
+    from redis.cluster import RedisCluster as SyncRedisCluster
+    from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
     optional_features.register('redis')
 except ImportError:
     pass
 
 
 class RedisPersistentDict(PersistentDict):
+    """
+    A PersistentDict backed by Redis (standalone or cluster) with async & sync support.
+    Switches to cluster mode only when WORK_ENV=KUBERNETES.
+    """
 
-    def __init__(self, *, url: str, id: str, key_prefix: str = 'nicegui:') -> None:  # pylint: disable=redefined-builtin
+    def __init__(
+        self,
+        *,
+        url: str,
+        id: str,
+        key_prefix: str = 'nicegui:'
+    ) -> None:
         if not optional_features.has('redis'):
-            raise ImportError('Redis is not installed. Please run "pip install nicegui[redis]".')
+            raise ImportError(
+                'Redis support is not installed. '
+                'Please run "pip install nicegui[redis]".'
+            )
+
         self.url = url
-        self.redis_client = redis.from_url(
-            url,
-            health_check_interval=10,
-            socket_connect_timeout=5,
-            retry_on_timeout=True,
-            socket_keepalive=True,
-        )
-        self.pubsub = self.redis_client.pubsub()
         self.key = key_prefix + id
+
+        # Determine mode from environment
+        is_cluster = os.getenv('WORK_ENV', '').upper() == 'KUBERNETES'
+        self.is_cluster = is_cluster
+
+        # Instantiate the appropriate async client
+        if is_cluster:
+            self.redis_client = AsyncRedisCluster.from_url(
+                url,
+                health_check_interval=10,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+                socket_keepalive=True,
+            )
+        else:
+            self.redis_client = redis_async.from_url(
+                url,
+                health_check_interval=10,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+                socket_keepalive=True,
+            )
+
+        # Prepare pub/sub for change notifications
+        self.pubsub = self.redis_client.pubsub()
+
         super().__init__(data={}, on_change=self.publish)
 
     async def initialize(self) -> None:
         """Load initial data from Redis and start listening for changes."""
         try:
-            data = await self.redis_client.get(self.key)
-            self.update(json.loads(data) if data else {})
+            raw = await self.redis_client.get(self.key)
+            self.update(json.loads(raw) if raw else {})
             self._start_listening()
         except Exception:
             log.warning(f'Could not load data from Redis with key {self.key}')
 
     def initialize_sync(self) -> None:
-        """Load initial data from Redis and start listening for changes in a synchronous context."""
-        with redis_sync.from_url(
+        """Synchronous context: load data and subscribe to changes."""
+        client_cls = SyncRedisCluster if self.is_cluster else redis.Redis
+        with client_cls.from_url(
             self.url,
             health_check_interval=10,
             socket_connect_timeout=5,
             retry_on_timeout=True,
             socket_keepalive=True,
-        ) as redis_client_sync:
+        ) as client:
             try:
-                data = redis_client_sync.get(self.key)
-                self.update(json.loads(data) if data else {})
+                raw = client.get(self.key)
+                self.update(json.loads(raw) if raw else {})
                 self._start_listening()
             except Exception:
                 log.warning(f'Could not load data from Redis with key {self.key}')
 
     def _start_listening(self) -> None:
+        """Subscribe to change channel and apply updates from other instances."""
         async def listen():
             await self.pubsub.subscribe(self.key + 'changes')
-            async for message in self.pubsub.listen():
-                if message['type'] == 'message':
-                    new_data = json.loads(message['data'])
-                    if new_data != self:
-                        self.update(new_data)
+            async for msg in self.pubsub.listen():
+                if msg.get('type') == 'message':
+                    new = json.loads(msg['data'])
+                    if new != self:
+                        self.update(new)
 
         if core.loop and core.loop.is_running():
             background_tasks.create(listen(), name=f'redis-listen-{self.key}')
@@ -67,26 +104,31 @@ class RedisPersistentDict(PersistentDict):
             core.app.on_startup(listen())
 
     def publish(self) -> None:
-        """Publish the data to Redis and notify other instances."""
+        """Persist current dict to Redis and broadcast a change event."""
         async def backup() -> None:
-            pipeline = self.redis_client.pipeline()
-            pipeline.set(self.key, json.dumps(self))
-            pipeline.publish(self.key + 'changes', json.dumps(self))
-            await pipeline.execute()
+            pipe = self.redis_client.pipeline()
+            pipe.set(self.key, json.dumps(self))
+            pipe.publish(self.key + 'changes', json.dumps(self))
+            await pipe.execute()
+
         if core.loop:
             background_tasks.create_lazy(backup(), name=f'redis-{self.key}')
         else:
             core.app.on_startup(backup())
 
     async def close(self) -> None:
-        """Close Redis connection and subscription."""
+        """Unsubscribe and close the Redis connection cleanly."""
         await self.pubsub.unsubscribe()
         await self.pubsub.close()
         await self.redis_client.close()
 
     def clear(self) -> None:
+        """Clear in-memory dict and delete the key from Redis."""
         super().clear()
         if core.loop:
-            background_tasks.create_lazy(self.redis_client.delete(self.key), name=f'redis-delete-{self.key}')
+            background_tasks.create_lazy(
+                self.redis_client.delete(self.key),
+                name=f'redis-delete-{self.key}'
+            )
         else:
             core.app.on_startup(self.redis_client.delete(self.key))
