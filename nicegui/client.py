@@ -23,6 +23,7 @@ from .javascript_request import JavaScriptRequest
 from .logging import log
 from .observables import ObservableDict
 from .outbox import Outbox
+from .sub_pages_router import SubPagesRouter
 from .translations import translations
 from .version import __version__
 
@@ -87,6 +88,9 @@ class Client:
         self.disconnect_handlers: List[Union[Callable[..., Any], Awaitable]] = []
 
         self._temporary_socket_id: Optional[str] = None
+
+        with self:
+            self.sub_pages_router = SubPagesRouter(request)
 
     @property
     def is_auto_index_client(self) -> bool:
@@ -155,7 +159,8 @@ class Client:
                 'imports': json.dumps(imports),
                 'js_imports': '\n'.join(js_imports),
                 'js_imports_urls': js_imports_urls,
-                'quasar_config': json.dumps(core.app.config.quasar_config),
+                'vue_config': json.dumps(core.app.config.quasar_config),
+                'vue_config_script': core.app.config.vue_config_script,
                 'title': self.resolve_title(),
                 'viewport': self.page.resolve_viewport(),
                 'favicon_url': get_favicon_url(self.page, prefix),

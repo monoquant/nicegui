@@ -5,10 +5,11 @@ from ..logging import log
 from .persistent_dict import PersistentDict
 
 try:
-    import redis                             # sync standalone
-    import redis.asyncio as redis_async      # async standalone
+    import redis as redis_sync                      # sync standalone
+    import redis.asyncio as redis_async             # async standalone
     from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
     from redis.cluster import RedisCluster as SyncRedisCluster
+    import redis.exceptions as redis_exceptions
     optional_features.register('redis')
 except ImportError:
     pass
@@ -16,8 +17,9 @@ except ImportError:
 
 class RedisPersistentDict(PersistentDict):
     """
-    PersistentDict backed by Redis (standalone or cluster), now with optional
+    PersistentDict backed by Redis (standalone or cluster), with optional
     injection of `kv_client` and `pubsub_client` to enable shared connection reuse.
+    Includes robust pubsub lifecycle handling and avoids creating empty keys.
     """
 
     def __init__(
@@ -39,6 +41,7 @@ class RedisPersistentDict(PersistentDict):
         self.url = url
         self.key = key_prefix + id
         self.is_cluster = cluster
+        self._should_listen = True  # upstream improvement
 
         # 1) Key-Value client: use injected or create new
         if kv_client is not None:
@@ -67,7 +70,7 @@ class RedisPersistentDict(PersistentDict):
             self.pubsub_client = pubsub_client
         else:
             if cluster:
-                # Cluster client lacks pubsub()/publish()
+                # Cluster client lacks pubsub()/publish() reliability; use standalone for pubsub
                 self.pubsub_client = redis_async.from_url(
                     url,
                     health_check_interval=10,
@@ -93,7 +96,7 @@ class RedisPersistentDict(PersistentDict):
 
     def initialize_sync(self) -> None:
         """Synchronous context: load data and subscribe to changes."""
-        client_cls = SyncRedisCluster if self.is_cluster else redis.Redis
+        client_cls = SyncRedisCluster if self.is_cluster else redis_sync.Redis
         kwargs = {} if self.is_cluster else {'retry_on_timeout': True}
         with client_cls.from_url(
             self.url,
@@ -110,14 +113,29 @@ class RedisPersistentDict(PersistentDict):
                 log.warning(f'Could not load data from Redis with key {self.key}')
 
     def _start_listening(self) -> None:
-        """Subscribe to the change channel and propagate updates."""
+        """Subscribe to the change channel and propagate updates with robust lifecycle handling."""
         async def listen():
-            await self.pubsub.subscribe(self.key + 'changes')
-            async for msg in self.pubsub.listen():
-                if msg.get('type') == 'message':
-                    new = json.loads(msg['data'])
-                    if new != self:
-                        self.update(new)
+            try:
+                if not self._should_listen:
+                    return
+                await self.pubsub.subscribe(self.key + 'changes')
+                if not self._should_listen:
+                    await self.pubsub.unsubscribe()
+                    return
+                async for msg in self.pubsub.listen():
+                    t = msg.get('type')
+                    if t == 'message':
+                        new = json.loads(msg['data'])
+                        if new != self:
+                            self.update(new)
+                    elif t in ('unsubscribe', 'punsubscribe') and msg.get('data') == 0:
+                        # last subscription removed -> exit
+                        break
+            except Exception as e:
+                # tolerate connection close during shutdown
+                if isinstance(e, redis_exceptions.ConnectionError) and not self._should_listen:
+                    return
+                log.exception(f'Unexpected error in Redis listener for {self.key}')
 
         if core.loop and core.loop.is_running():
             background_tasks.create(listen(), name=f'redis-listen-{self.key}')
@@ -127,9 +145,17 @@ class RedisPersistentDict(PersistentDict):
     def publish(self) -> None:
         """Persist data and notify other instances, handling cluster pipeline restrictions."""
         async def backup() -> None:
+            # Upstream behavior: don't create an empty key on first write
+            try:
+                if not await self.kv_client.exists(self.key) and not self:
+                    return
+            except Exception:
+                # exists may fail on some cluster states; proceed with write
+                pass
+
             data = json.dumps(self)
             if self.is_cluster:
-                # Cluster mode: no pipeline.publish()
+                # Cluster mode: pipeline.publish is not supported reliably; do sequential writes
                 await self.kv_client.set(self.key, data)
                 await self.pubsub_client.publish(self.key + 'changes', data)
             else:
@@ -146,11 +172,25 @@ class RedisPersistentDict(PersistentDict):
 
     async def close(self) -> None:
         """Unsubscribe and close Redis connections cleanly."""
-        await self.pubsub.unsubscribe()
-        await self.pubsub.close()
-        await self.kv_client.close()
-        if self.pubsub_client is not self.kv_client:
-            await self.pubsub_client.close()
+        self._should_listen = False
+        try:
+            # only attempt unsubscribe if currently subscribed
+            if getattr(self.pubsub, 'subscribed', False):
+                await self.pubsub.unsubscribe()
+        except Exception:
+            # ignore errors on shutdown
+            pass
+        try:
+            await self.pubsub.close()
+        finally:
+            try:
+                await self.kv_client.close()
+            finally:
+                if self.pubsub_client is not self.kv_client:
+                    try:
+                        await self.pubsub_client.close()
+                    except Exception:
+                        pass
 
     def clear(self) -> None:
         """Clear in-memory data and delete the Redis key."""
