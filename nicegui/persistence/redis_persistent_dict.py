@@ -1,16 +1,17 @@
-import os
+import asyncio
 from typing import Optional
 from .. import background_tasks, core, json, optional_features
 from ..logging import log
 from .persistent_dict import PersistentDict
 
 try:
-    import redis as redis_sync                      # sync standalone
-    import redis.asyncio as redis_async             # async standalone
+    import redis as redis_sync  # sync standalone
+    import redis.asyncio as redis_async  # async standalone
     from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
     from redis.cluster import RedisCluster as SyncRedisCluster
     import redis.exceptions as redis_exceptions
-    optional_features.register('redis')
+
+    optional_features.register("redis")
 except ImportError:
     pass
 
@@ -19,7 +20,10 @@ class RedisPersistentDict(PersistentDict):
     """
     PersistentDict backed by Redis (standalone or cluster), with optional
     injection of `kv_client` and `pubsub_client` to enable shared connection reuse.
-    Includes robust pubsub lifecycle handling and avoids creating empty keys.
+    Adds:
+      - robust pubsub reconnect loop (recreate pubsub on disconnect)
+      - publish() retries on transient connection errors
+      - avoids creating key when dict is empty and key doesn't exist yet
     """
 
     def __init__(
@@ -27,28 +31,28 @@ class RedisPersistentDict(PersistentDict):
         *,
         url: str,
         id: str,
-        key_prefix: str = 'nicegui:',
+        key_prefix: str = "nicegui:",
         cluster: bool = False,
         kv_client: Optional[redis_async.Redis] = None,
         pubsub_client: Optional[redis_async.Redis] = None,
     ) -> None:
-        if not optional_features.has('redis'):
-            raise ImportError(
-                'Redis support is not installed. '
-                'Please run "pip install nicegui[redis]".'
-            )
+        if not optional_features.has("redis"):
+            raise ImportError("Redis support is not installed. " 'Please run "pip install nicegui[redis]".')
 
         self.url = url
         self.key = key_prefix + id
         self.is_cluster = cluster
-        self._should_listen = True  # upstream improvement
+        self._should_listen = True
 
-        # 1) Key-Value client: use injected or create new
+        # Track ownership so we only recreate what we created
+        self._own_kv = kv_client is None
+        self._own_pubsub_client = pubsub_client is None
+
+        # KV client
         if kv_client is not None:
             self.kv_client = kv_client
         else:
             if cluster:
-                # AsyncRedisCluster.from_url() for cluster mode
                 self.kv_client = AsyncRedisCluster.from_url(
                     url,
                     health_check_interval=10,
@@ -56,7 +60,6 @@ class RedisPersistentDict(PersistentDict):
                     socket_keepalive=True,
                 )
             else:
-                # Standalone async client supports retry_on_timeout
                 self.kv_client = redis_async.from_url(
                     url,
                     health_check_interval=10,
@@ -65,12 +68,11 @@ class RedisPersistentDict(PersistentDict):
                     socket_keepalive=True,
                 )
 
-        # 2) Pub/Sub client: use injected or create new
+        # Pub/Sub client (separate from cluster client for reliability)
         if pubsub_client is not None:
             self.pubsub_client = pubsub_client
         else:
             if cluster:
-                # Cluster client lacks pubsub()/publish() reliability; use standalone for pubsub
                 self.pubsub_client = redis_async.from_url(
                     url,
                     health_check_interval=10,
@@ -80,9 +82,7 @@ class RedisPersistentDict(PersistentDict):
             else:
                 self.pubsub_client = self.kv_client
 
-        # 3) Create PubSub object from the chosen client
         self.pubsub = self.pubsub_client.pubsub()
-
         super().__init__(data={}, on_change=self.publish)
 
     async def initialize(self) -> None:
@@ -92,81 +92,148 @@ class RedisPersistentDict(PersistentDict):
             self.update(json.loads(raw) if raw else {})
             self._start_listening()
         except Exception:
-            log.warning(f'Could not load data from Redis with key {self.key}')
+            # If Redis isn't up yet or key can't be read, just warn and continue.
+            log.warning(f"Could not load data from Redis with key {self.key}")
 
     def initialize_sync(self) -> None:
         """Synchronous context: load data and subscribe to changes."""
         client_cls = SyncRedisCluster if self.is_cluster else redis_sync.Redis
-        kwargs = {} if self.is_cluster else {'retry_on_timeout': True}
+        kwargs = {} if self.is_cluster else {"retry_on_timeout": True}
         with client_cls.from_url(
-            self.url,
-            health_check_interval=10,
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-            **kwargs
+            self.url, health_check_interval=10, socket_connect_timeout=5, socket_keepalive=True, **kwargs
         ) as client:
             try:
                 raw = client.get(self.key)
                 self.update(json.loads(raw) if raw else {})
                 self._start_listening()
             except Exception:
-                log.warning(f'Could not load data from Redis with key {self.key}')
+                log.warning(f"Could not load data from Redis with key {self.key}")
+
+    def _new_pubsub(self):
+        """Create a fresh pubsub bound to current pubsub_client."""
+        try:
+            # Best effort close old pubsub
+            if getattr(self, "pubsub", None):
+                try:
+                    if getattr(self.pubsub, "subscribed", False):
+                        # Don't await here (might be called outside task); listener does awaits.
+                        pass
+                except Exception:
+                    pass
+        finally:
+            self.pubsub = self.pubsub_client.pubsub()
 
     def _start_listening(self) -> None:
         """Subscribe to the change channel and propagate updates with robust lifecycle handling."""
+
         async def listen():
-            try:
-                if not self._should_listen:
-                    return
-                await self.pubsub.subscribe(self.key + 'changes')
-                if not self._should_listen:
-                    await self.pubsub.unsubscribe()
-                    return
-                async for msg in self.pubsub.listen():
-                    t = msg.get('type')
-                    if t == 'message':
-                        new = json.loads(msg['data'])
-                        if new != self:
-                            self.update(new)
-                    elif t in ('unsubscribe', 'punsubscribe') and msg.get('data') == 0:
-                        # last subscription removed -> exit
-                        break
-            except Exception as e:
-                # tolerate connection close during shutdown
-                if isinstance(e, redis_exceptions.ConnectionError) and not self._should_listen:
-                    return
-                log.exception(f'Unexpected error in Redis listener for {self.key}')
+            backoff = 0.2
+            max_backoff = 5.0
+            channel = self.key + "changes"
+            while self._should_listen:
+                try:
+                    # (Re)create pubsub after any disconnect
+                    self._new_pubsub()
+                    await self.pubsub.subscribe(channel)
+                    # Reset backoff on successful subscribe
+                    backoff = 0.2
+
+                    async for msg in self.pubsub.listen():
+                        if not self._should_listen:
+                            break
+                        t = msg.get("type")
+                        if t == "message":
+                            new = json.loads(msg["data"])
+                            if new != self:
+                                self.update(new)
+                        elif t in ("unsubscribe", "punsubscribe") and msg.get("data") == 0:
+                            # No more subscriptions -> exit loop, will reconnect if still should listen
+                            break
+
+                except (redis_exceptions.ConnectionError, redis_exceptions.TimeoutError) as e:
+                    if not self._should_listen:
+                        return
+                    log.warning(f"Redis pubsub disconnected for {self.key}: {e}; retrying in {backoff:.1f}s")
+                    # Close and backoff, then loop to recreate and resubscribe
+                    try:
+                        await self.pubsub.close()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(backoff)
+                    backoff = min(max_backoff, backoff * 2.0)
+                    continue
+                except Exception:
+                    if not self._should_listen:
+                        return
+                    log.exception(f"Unexpected error in Redis listener for {self.key}")
+                    # Small backoff to avoid hot loop on repeated error
+                    await asyncio.sleep(0.5)
+                finally:
+                    # Ensure pubsub is closed before next iteration/exit
+                    try:
+                        if getattr(self.pubsub, "subscribed", False):
+                            await self.pubsub.unsubscribe()
+                    except Exception:
+                        pass
+                    try:
+                        await self.pubsub.close()
+                    except Exception:
+                        pass
 
         if core.loop and core.loop.is_running():
-            background_tasks.create(listen(), name=f'redis-listen-{self.key}')
+            background_tasks.create(listen(), name=f"redis-listen-{self.key}")
         else:
             core.app.on_startup(listen())
 
     def publish(self) -> None:
-        """Persist data and notify other instances, handling cluster pipeline restrictions."""
+        """Persist data and notify other instances, handling cluster pipeline limitations and retries."""
+
         async def backup() -> None:
-            # Upstream behavior: don't create an empty key on first write
+            # Don't create an empty key on first write
             try:
                 if not await self.kv_client.exists(self.key) and not self:
                     return
             except Exception:
-                # exists may fail on some cluster states; proceed with write
+                # If exists() fails (e.g., transient cluster state), proceed anyway
                 pass
 
             data = json.dumps(self)
+
+            async def _retry(coro_factory, attempts=3):
+                delay = 0.2
+                for i in range(1, attempts + 1):
+                    try:
+                        return await coro_factory()
+                    except (
+                        redis_exceptions.ConnectionError,
+                        redis_exceptions.TimeoutError,
+                        redis_exceptions.RedisError,
+                    ) as e:
+                        if i == attempts:
+                            raise
+                        log.warning(f"Redis write retry {i}/{attempts-1} for {self.key}: {e}")
+                        await asyncio.sleep(delay)
+                        delay = min(2.0, delay * 2.0)
+
             if self.is_cluster:
-                # Cluster mode: pipeline.publish is not supported reliably; do sequential writes
-                await self.kv_client.set(self.key, data)
-                await self.pubsub_client.publish(self.key + 'changes', data)
+                # Cluster: publish and set sequentially (pipelines can be flaky across slots)
+                async def do_cluster():
+                    await self.kv_client.set(self.key, data)
+                    await self.pubsub_client.publish(self.key + "changes", data)
+
+                await _retry(lambda: do_cluster())
             else:
                 # Standalone: pipeline both commands together
-                pipe = self.kv_client.pipeline()
-                pipe.set(self.key, data)
-                pipe.publish(self.key + 'changes', data)
-                await pipe.execute()
+                async def do_standalone():
+                    pipe = self.kv_client.pipeline()
+                    pipe.set(self.key, data)
+                    pipe.publish(self.key + "changes", data)
+                    await pipe.execute()
+
+                await _retry(lambda: do_standalone())
 
         if core.loop:
-            background_tasks.create_lazy(backup(), name=f'redis-{self.key}')
+            background_tasks.create_lazy(backup(), name=f"redis-{self.key}")
         else:
             core.app.on_startup(backup())
 
@@ -174,14 +241,16 @@ class RedisPersistentDict(PersistentDict):
         """Unsubscribe and close Redis connections cleanly."""
         self._should_listen = False
         try:
-            # only attempt unsubscribe if currently subscribed
-            if getattr(self.pubsub, 'subscribed', False):
-                await self.pubsub.unsubscribe()
-        except Exception:
-            # ignore errors on shutdown
-            pass
-        try:
-            await self.pubsub.close()
+            if getattr(self, "pubsub", None):
+                try:
+                    if getattr(self.pubsub, "subscribed", False):
+                        await self.pubsub.unsubscribe()
+                except Exception:
+                    pass
+                try:
+                    await self.pubsub.close()
+                except Exception:
+                    pass
         finally:
             try:
                 await self.kv_client.close()
@@ -196,9 +265,6 @@ class RedisPersistentDict(PersistentDict):
         """Clear in-memory data and delete the Redis key."""
         super().clear()
         if core.loop:
-            background_tasks.create_lazy(
-                self.kv_client.delete(self.key),
-                name=f'redis-delete-{self.key}'
-            )
+            background_tasks.create_lazy(self.kv_client.delete(self.key), name=f"redis-delete-{self.key}")
         else:
             core.app.on_startup(self.kv_client.delete(self.key))
