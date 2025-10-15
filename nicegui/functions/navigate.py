@@ -26,7 +26,7 @@ class Navigate:
         Navigates back in the browser history.
         It is equivalent to clicking the back button in the browser.
         """
-        run_javascript('history.back()')
+        run_javascript("history.back()")
 
     def forward(self) -> None:
         """ui.navigate.forward
@@ -34,7 +34,7 @@ class Navigate:
         Navigates forward in the browser history.
         It is equivalent to clicking the forward button in the browser.
         """
-        run_javascript('history.forward()')
+        run_javascript("history.forward()")
 
     def reload(self) -> None:
         """ui.navigate.reload
@@ -42,7 +42,7 @@ class Navigate:
         Reload the current page.
         It is equivalent to clicking the reload button in the browser.
         """
-        run_javascript('history.go(0)')
+        run_javascript("history.go(0)")
 
     def to(self, target: Union[Callable[..., Any], str, Element], new_tab: bool = False) -> None:
         """ui.navigate.to (formerly ui.open)
@@ -64,21 +64,21 @@ class Navigate:
         if isinstance(target, str):
             path = target
         elif isinstance(target, Element):
-            path = f'#{target.html_id}'
+            path = f"#{target.html_id}"
         elif callable(target):
             path = Client.page_routes[target]
         else:
-            raise TypeError(f'Invalid target type: {type(target)}')
+            raise TypeError(f"Invalid target type: {type(target)}")
 
-        if not new_tab and isinstance(target, str):
-            parsed = urlparse(path)
-            if not parsed.scheme and not parsed.netloc and \
-                    any(isinstance(el, SubPages) for el in context.client.elements.values()):
-                async def navigate_sub_pages(client: Client) -> None:
-                    with client:
-                        await client.sub_pages_router._handle_navigate(path)  # pylint: disable=protected-access
-                background_tasks.create(navigate_sub_pages(context.client), name='navigate_sub_pages')
-                return
+        # if not new_tab and isinstance(target, str):
+        #     parsed = urlparse(path)
+        #     if not parsed.scheme and not parsed.netloc and \
+        #             any(isinstance(el, SubPages) for el in context.client.elements.values()):
+        #         async def navigate_sub_pages(client: Client) -> None:
+        #             with client:
+        #                 await client.sub_pages_router._handle_navigate(path)  # pylint: disable=protected-access
+        #         background_tasks.create(navigate_sub_pages(context.client), name='navigate_sub_pages')
+        #         return
 
         context.client.open(path, new_tab)
 
