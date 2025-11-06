@@ -50,6 +50,13 @@ class MappedAsyncSentinel(AsyncSentinel):
 
 
 class RedisPersistentDict(PersistentDict):
+    """
+    Redis-backed persistent dictionary with support for connection pooling.
+
+    Design:
+    - Main redis_client is shared (pooled) for data operations (get/set/publish)
+    - Pubsub connection is created separately per instance to avoid conflicts
+    """
 
     def __init__(
         self,
@@ -69,10 +76,18 @@ class RedisPersistentDict(PersistentDict):
         self._should_listen = True
         self._is_sentinel = url.startswith("redis+sentinel://")
         self._hostmap = hostmap or {}
+        self._sentinel = None  # Store sentinel reference for proper cleanup
+        self._owns_client = redis_client is None  # Track if we created the main client
 
+        # Separate tracking for pubsub connection
+        self._pubsub_client = None
+        self._pubsub_sentinel = None
+        self.pubsub = None
+
+        # Create or use provided main client (for data operations)
         if self.redis_client is None:
             if self._is_sentinel:
-                self.redis_client = self._create_sentinel_client(url)
+                self.redis_client, self._sentinel = self._create_sentinel_client(url)
             else:
                 self.redis_client = redis.from_url(
                     url,
@@ -81,9 +96,9 @@ class RedisPersistentDict(PersistentDict):
                     retry_on_timeout=True,
                     socket_keepalive=True,
                 )
-            self.pubsub = self.redis_client.pubsub()
-        else:
-            self.pubsub = self.redis_client.pubsub()
+
+        # Note: We DON'T create pubsub here anymore - it's created in _start_listening
+        # This allows the main client to be shared while pubsub is separate
 
         super().__init__(data={}, on_change=self.publish)
 
@@ -96,6 +111,9 @@ class RedisPersistentDict(PersistentDict):
         - db: database number (default: 0)
         - password: Redis password
         - hostmap: semicolon-separated host:ip mappings (e.g., hostmap=host.docker.internal:127.0.0.1;other:10.0.0.1)
+
+        Returns:
+            Tuple of (master_client, sentinel) so sentinel can be properly closed later
         """
         parsed = urlparse(url)
 
@@ -118,7 +136,6 @@ class RedisPersistentDict(PersistentDict):
         password = params.get("password", [None])[0]
 
         # Parse hostmap from query params if provided
-        # Use semicolon as separator to avoid conflicts with commas in sentinel hosts
         hostmap = self._hostmap.copy()
         if "hostmap" in params:
             for mapping in params["hostmap"][0].split(";"):
@@ -147,10 +164,14 @@ class RedisPersistentDict(PersistentDict):
             health_check_interval=10,
         )
 
-        return master
+        return master, sentinel
 
     def _create_sentinel_client_sync(self, url: str):
-        """Create a synchronous Redis client from Sentinel URL."""
+        """Create a synchronous Redis client from Sentinel URL.
+
+        Returns:
+            Tuple of (master_client, sentinel) so sentinel can be properly closed later
+        """
         parsed = urlparse(url)
 
         # Parse sentinel hosts
@@ -170,7 +191,6 @@ class RedisPersistentDict(PersistentDict):
         password = params.get("password", [None])[0]
 
         # Parse hostmap from query params if provided
-        # Use semicolon as separator to avoid conflicts with commas in sentinel hosts
         hostmap = self._hostmap.copy()
         if "hostmap" in params:
             for mapping in params["hostmap"][0].split(";"):
@@ -199,7 +219,7 @@ class RedisPersistentDict(PersistentDict):
             health_check_interval=10,
         )
 
-        return master
+        return master, sentinel
 
     async def initialize(self) -> None:
         """Load initial data from Redis and start listening for changes."""
@@ -212,35 +232,73 @@ class RedisPersistentDict(PersistentDict):
 
     def initialize_sync(self) -> None:
         """Load initial data from Redis and start listening for changes in a synchronous context."""
-        if self._is_sentinel:
-            redis_client_sync = self._create_sentinel_client_sync(self.url)
-        else:
-            redis_client_sync = redis_sync.from_url(
-                self.url,
-                health_check_interval=10,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-                socket_keepalive=True,
-            )
+        redis_client_sync = None
+        sentinel_sync = None
+
         try:
+            if self._is_sentinel:
+                redis_client_sync, sentinel_sync = self._create_sentinel_client_sync(self.url)
+            else:
+                redis_client_sync = redis_sync.from_url(
+                    self.url,
+                    health_check_interval=10,
+                    socket_connect_timeout=5,
+                    retry_on_timeout=True,
+                    socket_keepalive=True,
+                )
+
             data = redis_client_sync.get(self.key)
             self.update(json.loads(data) if data else {})
             self._start_listening()
         except Exception:
             log.warning(f"Could not load data from Redis with key {self.key}")
         finally:
-            if self._is_sentinel:
-                redis_client_sync.close()
+            # Properly close sync clients
+            if redis_client_sync is not None:
+                try:
+                    redis_client_sync.close()
+                except Exception:
+                    pass
+            if sentinel_sync is not None:
+                try:
+                    sentinel_sync.close()
+                except Exception:
+                    pass
 
     def _start_listening(self) -> None:
+        """
+        Start pubsub listener with a SEPARATE dedicated connection.
+
+        This avoids conflicts when multiple RedisPersistentDict instances
+        share the same main redis_client for data operations.
+        """
+
         async def listen():
             try:
+                # Create dedicated connection for pubsub
+                if self._is_sentinel:
+                    self._pubsub_client, self._pubsub_sentinel = self._create_sentinel_client(self.url)
+                else:
+                    self._pubsub_client = redis.from_url(
+                        self.url,
+                        health_check_interval=10,
+                        socket_connect_timeout=5,
+                        retry_on_timeout=True,
+                        socket_keepalive=True,
+                    )
+
+                # Create pubsub from dedicated connection
+                self.pubsub = self._pubsub_client.pubsub()
+
                 if not self._should_listen:
                     return
+
                 await self.pubsub.subscribe(self.key + "changes")
+
                 if not self._should_listen:
                     await self.pubsub.unsubscribe()
                     return
+
                 async for message in self.pubsub.listen():
                     t = message["type"]
                     if t == "message":
@@ -249,10 +307,28 @@ class RedisPersistentDict(PersistentDict):
                             self.update(new_data)
                     elif t in ("unsubscribe", "punsubscribe") and message.get("data") == 0:
                         break
+
             except Exception as e:
                 if isinstance(e, redis_exceptions.ConnectionError) and not self._should_listen:
-                    return  # NOTE: on quick instantiation cycles, unsubscribe event might not be received before the connection is closed
+                    return
                 log.exception(f"Unexpected error in Redis listener for {self.key}")
+            finally:
+                # Clean up pubsub connection
+                if self.pubsub:
+                    try:
+                        await self.pubsub.close()
+                    except Exception:
+                        pass
+                if self._pubsub_client:
+                    try:
+                        await self._pubsub_client.close()
+                    except Exception:
+                        pass
+                if self._pubsub_sentinel:
+                    try:
+                        await self._pubsub_sentinel.close()
+                    except Exception:
+                        pass
 
         if core.loop and core.loop.is_running():
             background_tasks.create(listen(), name=f"redis-listen-{self.key}")
@@ -260,7 +336,7 @@ class RedisPersistentDict(PersistentDict):
             core.app.on_startup(listen())
 
     def publish(self) -> None:
-        """Publish the data to Redis and notify other instances."""
+        """Publish the data to Redis and notify other instances using the shared client."""
 
         async def backup() -> None:
             if not await self.redis_client.exists(self.key) and not self:
@@ -276,12 +352,31 @@ class RedisPersistentDict(PersistentDict):
             core.app.on_startup(backup())
 
     async def close(self) -> None:
-        """Close Redis connection and subscription."""
+        """Close Redis connections and subscription."""
         self._should_listen = False
-        if self.pubsub.subscribed:
-            await self.pubsub.unsubscribe()
-        await self.pubsub.close()
-        await self.redis_client.close()
+
+        # Close pubsub and its dedicated connection (handled by listen() finally block)
+        # Just wait a moment for cleanup
+        if self.pubsub:
+            try:
+                if self.pubsub.subscribed:
+                    await self.pubsub.unsubscribe()
+            except Exception:
+                pass
+
+        # Close main redis client if we own it
+        if self._owns_client and self.redis_client is not None:
+            try:
+                await self.redis_client.close()
+            except Exception:
+                pass
+
+        # Close main sentinel if we created one
+        if self._sentinel is not None:
+            try:
+                await self._sentinel.close()
+            except Exception:
+                pass
 
     def clear(self) -> None:
         super().clear()
