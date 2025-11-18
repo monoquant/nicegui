@@ -1,5 +1,6 @@
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
+import asyncio
 
 from .. import background_tasks, core, json, optional_features
 from ..logging import log
@@ -268,12 +269,13 @@ class RedisPersistentDict(PersistentDict):
     def _start_listening(self) -> None:
         """
         Start pubsub listener with a SEPARATE dedicated connection.
-
-        This avoids conflicts when multiple RedisPersistentDict instances
-        share the same main redis_client for data operations.
+        FIXED: Uses timeout to check _should_listen periodically instead of blocking forever.
         """
 
+        print(f"[DEBUG] _start_listening called for {self.key}")
+
         async def listen():
+            print(f"[DEBUG] listen() coroutine started for {self.key}")
             try:
                 # Create dedicated connection for pubsub
                 if self._is_sentinel:
@@ -299,14 +301,51 @@ class RedisPersistentDict(PersistentDict):
                     await self.pubsub.unsubscribe()
                     return
 
-                async for message in self.pubsub.listen():
-                    t = message["type"]
-                    if t == "message":
-                        new_data = json.loads(message["data"])
-                        if new_data != self:
-                            self.update(new_data)
-                    elif t in ("unsubscribe", "punsubscribe") and message.get("data") == 0:
-                        break
+                # ============ THE FIX ============
+                # Use get_message() with timeout instead of async for loop
+                # This allows checking _should_listen every 2 seconds
+
+                log.info(f"Redis listener started for {self.key}")
+
+                while self._should_listen:
+                    try:
+                        # Wait for message with 2 second timeout
+                        message = await asyncio.wait_for(
+                            self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0), timeout=2.0
+                        )
+
+                        if message is None:
+                            # No message - loop will check _should_listen and continue
+                            continue
+
+                        # Process message
+                        t = message.get("type")
+                        if t == "message":
+                            new_data = json.loads(message["data"])
+                            if new_data != self:
+                                self.update(new_data)
+                        elif t in ("unsubscribe", "punsubscribe") and message.get("data") == 0:
+                            break
+
+                    except asyncio.TimeoutError:
+                        # Timeout is EXPECTED - just continue to check _should_listen
+                        continue
+
+                    except redis_exceptions.ConnectionError:
+                        if not self._should_listen:
+                            # Connection closed intentionally
+                            break
+                        # Connection lost unexpectedly - try to reconnect once
+                        log.warning(f"Redis connection lost for {self.key}, attempting reconnect...")
+                        await asyncio.sleep(1)
+                        try:
+                            await self.pubsub.subscribe(self.key + "changes")
+                        except Exception as e:
+                            log.error(f"Failed to reconnect Redis listener for {self.key}: {e}")
+                            break
+
+                log.debug(f"Redis listener exited for {self.key} (_should_listen={self._should_listen})")
+                # ============ END FIX ============
 
             except Exception as e:
                 if isinstance(e, redis_exceptions.ConnectionError) and not self._should_listen:
@@ -314,7 +353,12 @@ class RedisPersistentDict(PersistentDict):
                 log.exception(f"Unexpected error in Redis listener for {self.key}")
             finally:
                 # Clean up pubsub connection
+                log.debug(f"Cleaning up Redis listener for {self.key}")
                 if self.pubsub:
+                    try:
+                        await self.pubsub.unsubscribe()
+                    except Exception:
+                        pass
                     try:
                         await self.pubsub.close()
                     except Exception:
@@ -330,10 +374,18 @@ class RedisPersistentDict(PersistentDict):
                     except Exception:
                         pass
 
+        print(f"[DEBUG] About to schedule {self.key}")
+        print(f"[DEBUG] core.loop exists: {core.loop is not None}")
+        print(f"[DEBUG] core.loop.is_running(): {core.loop.is_running() if core.loop else 'N/A'}")
+
         if core.loop and core.loop.is_running():
+            print(f"[DEBUG] 📋 Using background_tasks.create for {self.key}")
             background_tasks.create(listen(), name=f"redis-listen-{self.key}")
+            print(f"[DEBUG] ✅ Task created for {self.key}")
         else:
+            print(f"[DEBUG] 📋 Using app.on_startup for {self.key}")
             core.app.on_startup(listen())
+            print(f"[DEBUG] ✅ Startup handler registered for {self.key}")
 
     def publish(self) -> None:
         """Publish the data to Redis and notify other instances using the shared client."""
