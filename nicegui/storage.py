@@ -160,12 +160,6 @@ class Storage:
     async def _create_tab_storage(self, tab_id: str) -> None:
         """Create tab storage for the given tab ID."""
         if tab_id not in self._tabs:
-            # if Storage.redis_url:
-            #     self._tabs[tab_id] = Storage._create_persistent_dict(f'tab-{tab_id}')
-            #     tab = self._tabs[tab_id]
-            #     assert isinstance(tab, PersistentDict)
-            #     await tab.initialize()
-            # else:
             self._tabs[tab_id] = ObservableDict()
 
     def copy_tab(self, old_tab_id: str, tab_id: str) -> None:
